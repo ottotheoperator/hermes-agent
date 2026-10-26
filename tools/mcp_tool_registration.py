@@ -458,19 +458,199 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     return registered
 
 
+def _native_tool_names(name: str, server) -> dict[str, Any]:
+    """``{registry name: listed tool}`` for a live connection's OWN tools. The generated
+    resource/prompt/event utilities are absent on purpose: ``tools.include``/``exclude`` select the
+    server's own tools, so a filter edit must never be read as "drop the utilities"."""
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+
+    return {mcp_prefixed_tool_name(name, t.name): t for t in getattr(server, "_tools", None) or ()
+            if getattr(t, "name", None)}
+
+
+def _scope_toolset_names(name: str, server, scope) -> set[str]:
+    """Tool names THIS scope holds for the connection's ``mcp-{name}`` toolset. Every name the
+    connection could have registered here (its listed tools, what the connection reports, what the
+    ambient view shows) is filtered by the scope's LOCAL slot: the merged view answers for the ambient
+    scope, and a profile's own list may lag a registration, so neither alone is the truth, and neither
+    may borrow another profile's overlay of the same shared connection."""
+    from tools.registry import registry
+
+    candidates = set(_native_tool_names(name, server))
+    candidates.update(getattr(server, "_registered_tool_names", None) or ())
+    candidates.update(registry.get_tool_names_for_toolset(f"mcp-{name}"))
+    return {tool_name for tool_name in candidates
+            if registry.snapshot_registration(tool_name, scope=scope) is not None}
+
+
+def _tool_filter_signature(config: dict) -> tuple:
+    """Canonical form of the ``tools.include``/``exclude`` half of a config: "did the filter change".
+    ``_make_tool_filter`` reads a bare string as one exact name, so both spellings normalise alike."""
+    tools_filter = (config or {}).get("tools") or {}
+    if not isinstance(tools_filter, dict):
+        return (None, None)
+
+    def _one(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return sorted(str(v) for v in value)
+        return None
+
+    return (_one(tools_filter.get("include")), _one(tools_filter.get("exclude")))
+
+
+def _tool_name_still_held(tool_name: str, name: str) -> bool:
+    """Whether ANY scope of ANY connection called *name* still registers *tool_name*: this profile's own
+    connection, a scope that adopted it, or another profile's own connection of the same name. Provenance
+    and the connection's name list are keyed by tool name alone, so one scope dropping a tool must not
+    erase it for the others."""
+    from tools.registry import registry
+
+    with _core._lock:
+        scopes: set[Optional[str]] = {None}  # the process-global slot (single-profile processes register there)
+        for key, keyed in _core._server_tool_scopes.items():
+            if _key_name(key) == name:
+                scopes |= set(keyed)
+        for key in _core._servers:
+            if _key_name(key) == name:
+                scopes.add(_key_scope(key))
+    return any(registry.snapshot_registration(tool_name, scope=scope) is not None for scope in scopes)
+
+
+def reapply_tool_filters(servers: dict, scope: Optional[str] = None) -> dict[str, dict]:
+    """Re-apply a changed ``tools.include``/``tools.exclude`` to the connections already LIVE in this
+    scope, so the edit takes effect in the session that is running instead of at the next restart.
+
+    A live connection is never a connect candidate (``_select_new_servers``) and the reconcile leaves
+    the profile's own connection in place, so nothing used to re-read the filter: a tool the user
+    removed kept answering until the process restarted (t_aa995a52, the other half of t_5ef894b0 —
+    the identity fix stopped an edit from DETACHING the tools and would otherwise have left them
+    stale instead). This is the in-place refresh ``tools/list_changed`` performs, driven by the config
+    instead of the server: remove what the filter now rejects, register what it now selects, and
+    report the change once.
+
+    The trigger is the filter itself, compared with what the live connection was registered under
+    (``server._config`` is that config for a connection this profile owns), not "does the registry
+    still hold everything the filter selects": an overlay lost some other way is a different fault,
+    reported by ``_warn_connected_servers_without_tools``, and quietly rebuilt here would hide it.
+
+    Two limits, deliberate. Only a connection this profile OWNS is touched: an adopted connection's
+    ``_config`` belongs to the profile that opened it, so no comparison there can say whether THIS
+    profile's filter changed (its overlay keeps the filter it was adopted with, as today). And a
+    connection frozen for an editor session keeps the policy it was opened with, because
+    ``_register_server_tools`` refuses a changed manifest there by design.
+
+    Only the connection's own listed tools are compared (see :func:`_native_tool_names`): the
+    generated resource/prompt/event utilities are not selected by ``tools.include`` and must survive.
+
+    Returns ``{name: {"added": [...], "removed": [...]}}`` for the servers this call changed.
+    """
+    from tools.registry import registry
+
+    if scope is None:
+        scope = _core._mcp_registry_scope()
+    with _core._lock:
+        live = [(key, server) for key, server in _core._servers.items()
+                if getattr(server, "session", None) is not None
+                and getattr(server, "_tools", None)
+                and _key_scope(key) == scope
+                and _core._server_visible_in_scope(key, scope)]
+    changed: dict[str, dict] = {}
+    for key, server in live:
+        name = _key_name(key)
+        config = servers.get(name)
+        if config is None or not mcp_server_enabled(config):
+            continue
+        if (scope or "").startswith("editor-session:") or getattr(server, "_editor_frozen_manifest", None) is not None:
+            continue
+        if _tool_filter_signature(getattr(server, "_config", None) or {}) == _tool_filter_signature(config):
+            continue  # the filter this connection was registered under is still the configured one
+        if not _same_server_route(server, config):
+            # The route or the credentials changed too, so this edit is not a filter edit: the live
+            # session is a DIFFERENT connection and must be replaced, never re-labelled with a config
+            # it was not opened with (an adopted connection would then borrow the new identity).
+            continue
+        native = _native_tool_names(name, server)
+        should_register = _make_tool_filter(name, config)
+        kept = {tool_name for tool_name, tool in native.items() if should_register(tool.name)}
+        registered = _scope_toolset_names(name, server, scope)
+        removed = sorted((set(native) - kept) & registered)
+        # Names the filter now selects but this scope lacks. A name a built-in (or another MCP server)
+        # owns is passed along anyway: ``_register_candidates`` refuses it and says why, once, exactly
+        # as a fresh connect would, instead of this path dropping it in silence.
+        added_wanted = sorted(kept - registered)
+        for tool_name in removed:
+            registry.deregister(tool_name, scope=scope)
+        # Provenance (``_mcp_tool_server_names``) and the connection's own name list are per tool name,
+        # not per scope: another profile may still expose this tool, either through a scope that adopted
+        # this connection or through its own connection of the same name. Erasing either would blind the
+        # status/parallel-safety lookups and make teardown skip that profile's entry.
+        still_held = {tool_name for tool_name in removed if _tool_name_still_held(tool_name, name)}
+        for tool_name in removed:
+            if tool_name not in still_held:
+                _forget_mcp_tool_server(tool_name)
+        added: list[str] = []
+        if added_wanted:
+            candidates = _tool_candidates(name, [native[tool_name] for tool_name in added_wanted],
+                                          should_register, server.tool_timeout)
+            added = _register_candidates(
+                name, _resolve_name_collisions(name, candidates), check_fn=_make_check_fn(name),
+                scope=lambda: scope, lazy=False, key=key, execution_timeout=config.get("timeout"))
+        if removed:
+            _restore_server_toolset_alias(key)
+        with _core._lock:
+            registered_before = set(getattr(server, "_registered_tool_names", None) or ())
+            server._registered_tool_names = sorted(
+                ((registered_before - set(removed)) | still_held) | set(added))
+            # Only the filter half is recorded: the rest of ``_config`` still describes the session
+            # that is actually open (URL, credentials, TLS), which identity comparisons rely on. Recorded
+            # even when the effective set did not change, so the next pass does not re-judge this edit
+            # and the next ``tools/list_changed`` refresh does not fall back to the old filter.
+            recorded = dict(getattr(server, "_config", None) or {})
+            if "tools" in config:
+                recorded["tools"] = config["tools"]
+            else:
+                recorded.pop("tools", None)
+            server._config = recorded
+        # A lazy start reads the cache by the config fingerprint, which includes the filter: without
+        # this write it would rebuild the tool list from the filter we just replaced.
+        _write_schema_cache(name, server, config, should_register)
+        if removed or added:
+            detail = "; ".join(f"{label} {', '.join(names)}"
+                               for label, names in (("added", added), ("removed", removed)) if names)
+            logger.warning("MCP server '%s': the tools filter changed while the connection is live; "
+                           "re-applied it in place, no restart needed (%s)", name, detail)
+            changed[name] = {"added": added, "removed": removed}
+    return changed
+
+
+def _route_fingerprint(config: dict) -> str:
+    """``config_fingerprint`` with the ``tools`` filter dropped: the route half of a connection's
+    identity (command/args/url/transport), shared with the schema cache so the two cannot drift.
+
+    The include/exclude filter selects WHICH of a server's tools this profile registers; it neither
+    routes nor authenticates a connection, and an adopter always registers its own filtered set
+    (``_register_connected_into_current_scope``). Keying identity on it made a ``tools.include`` edit
+    read as a different connection, so the reconcile removed this profile's whole overlay of a
+    still-live server and nothing rebuilt it — discovery skips connected servers (t_5ef894b0)."""
+    from tools.mcp_schema_cache import config_fingerprint
+
+    return config_fingerprint({**config, "tools": {}})
+
+
 def _connection_identity(config: dict) -> tuple:
     """What makes one live connection reusable for another profile: the route fingerprint PLUS
     everything that authenticates or secures it (``config_fingerprint`` deliberately excludes
     credentials so the schema cache survives a token rotation). Two profiles pointing at the same URL
     with different headers/env/auth/client certificates/TLS policy are two identities; borrowing
     across them would call tools as the other user, or under the other profile's ``ssl_verify`` /
-    ``strict_redirect_headers``."""
-    from tools.mcp_schema_cache import config_fingerprint
-
+    ``strict_redirect_headers``. The ``tools`` filter is NOT part of the identity (see
+    :func:`_route_fingerprint`)."""
     def _frozen(value):
         return json.dumps(value or {}, sort_keys=True, default=str)
 
-    return (config_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
+    return (_route_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
             _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")),
             config.get("ssl_verify", True), bool(config.get("strict_redirect_headers")))
 

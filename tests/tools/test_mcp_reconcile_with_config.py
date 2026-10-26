@@ -2,6 +2,7 @@
 boot is torn down instead of self-probing for the life of the process."""
 
 import asyncio
+import logging
 
 import pytest
 
@@ -157,3 +158,59 @@ def test_reconcile_counts_adopted_shared_connection_as_live(monkeypatch, tmp_pat
             mcp_tool._servers.pop(("A", "x"), None)
             mcp_tool._server_scope_keys.pop(("A", "x"), None)
             mcp_tool._server_tool_scopes.pop(("A", "x"), None)
+
+
+@pytest.mark.no_isolate
+def test_reconcile_reapplies_a_changed_tools_filter_to_the_live_connection(monkeypatch, tmp_path, caplog):
+    """The housekeeping tick is what runs while the session stays up, so it must apply an edited
+    ``tools.include``: such an edit adds and removes no server, so discovery never runs for it and
+    the live connection kept its old filter until the process restarted (t_aa995a52)."""
+    from types import SimpleNamespace
+
+    from tools import mcp_tool
+    from tools import mcp_tool_config as _config
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_registration as _registration
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    before = {"url": "https://mcp.example.test/mcp", "tools": {"include": ["t", "t2"]}}
+    after = {**before, "tools": {"include": ["t"]}}
+    configured = {"aa99": dict(before)}
+    monkeypatch.setattr(_config, "_load_mcp_config", lambda: {name: dict(cfg) for name, cfg in configured.items()})
+    discovered: list = []
+    monkeypatch.setattr(disc, "discover_mcp_tools", lambda *a, **k: discovered.append(1) or [])
+
+    def _tool(tool_name: str) -> SimpleNamespace:
+        return SimpleNamespace(name=tool_name, description="d", inputSchema={"type": "object", "properties": {}},
+                               annotations=None)
+
+    server = SimpleNamespace(name="aa99", session=object(), _config=dict(before),
+                             _tools=[_tool("t"), _tool("t2")], tool_timeout=30,
+                             initialize_result=None, _registered_tool_names=[])
+    with mcp_tool._lock:
+        mcp_tool._servers["aa99"] = server
+        mcp_tool._server_scope_keys["aa99"] = None
+    try:
+        server._registered_tool_names = _registration._register_server_tools("aa99", server, before)
+        assert registry.get_tool_names_for_toolset("mcp-aa99") == ["mcp__aa99__t", "mcp__aa99__t2"]
+
+        configured["aa99"] = dict(after)  # the user narrows the list on disk; no server added or removed
+        with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+            for _ in range(3):  # the chore ticks again and again; the edit is reported once
+                assert disc.reconcile_mcp_servers_with_config() == {"removed": [], "added": [], "pending": []}
+        assert not discovered
+
+        reapplied = [r.getMessage() for r in caplog.records if "re-applied" in r.getMessage()]
+        assert len(reapplied) == 1, reapplied
+        assert registry.get_tool_names_for_toolset("mcp-aa99") == ["mcp__aa99__t"]
+        assert registry.get_entry("mcp__aa99__t2") is None
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._servers.pop("aa99", None)
+            mcp_tool._server_scope_keys.pop("aa99", None)
+            mcp_tool._server_tool_scopes.pop("aa99", None)
+        for name in ("mcp__aa99__t", "mcp__aa99__t2"):
+            registry.deregister(name, scope=None)
+            registry.deregister(name)
+        registry._drop_toolset_aliases("mcp-aa99")

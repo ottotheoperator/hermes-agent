@@ -536,6 +536,50 @@ def _log_summary(prefix: str, names, **lazy) -> None:
         logger.info(summary)
 
 
+def _warn_connected_servers_without_tools(servers: dict[str, dict]) -> None:
+    """Alarm on the one state nothing logged: a connection that is UP (session live, tools listed)
+    while this scope's registry holds none of its tools, so every session here runs without it.
+
+    That state does not heal itself. ``_select_new_servers`` skips a connected server (not a connect
+    candidate) and the reconcile skips this profile's own live connection, so neither path
+    re-registers it; only a restart or ``/reload-mcp`` rebuilds the list. On 2026-10-23 Hanna's
+    4-hourly run logged "111 MCP tool(s) available" instead of 125 with no other line anywhere
+    (t_5ef894b0), which is why the loss is worth one WARNING naming the server and the repair.
+
+    Read-only and never raises (it runs in ``register_mcp_servers``' cleanup). Two states are not a
+    loss and are not reported: a config whose filter selects nothing (``tools.include: []``), and a
+    connection that never registered a tool here (nothing was taken away; the registration-time
+    line already explains a collision).
+    """
+    try:
+        from tools.registry import registry
+        scope = _core._mcp_registry_scope()
+        with _core._lock:
+            live = [(key, server) for key, server in _core._servers.items()
+                    if getattr(server, "session", None) is not None
+                    and getattr(server, "_tools", None)
+                    and getattr(server, "_registered_tool_names", None)
+                    and _core._server_visible_in_scope(key, scope)]
+        for _key, server in live:
+            config = servers.get(server.name)
+            if config is None or not mcp_server_enabled(config):
+                continue
+            should_register = _registration._make_tool_filter(server.name, config)
+            if not any(should_register(t.name) for t in server._tools):
+                continue  # an explicit empty surface, not a loss
+            if registry.get_tool_names_for_toolset(f"mcp-{server.name}"):
+                continue
+            logger.warning(
+                "MCP server '%s': the connection is live (session up, %d tool(s) listed) but none of the "
+                "%d tool(s) it registered is in this scope's registry (%s), so sessions here run without "
+                "it. Discovery does not repair this while the connection stays up: restart the gateway, or "
+                "run /reload-mcp in the process that owns the connection, to rebuild the tool list.",
+                server.name, len(server._tools), len(server._registered_tool_names),
+                scope or "the process-global registry")
+    except Exception:  # health: allow BLE001 -- a diagnostic must never break discovery
+        logger.debug("MCP: connected-server tool check failed", exc_info=True)
+
+
 def register_mcp_servers(servers: dict[str, dict]) -> list[str]:
     """Connect ``{name: config}`` servers and register their tools; idempotent for connected
     names, ``enabled: false`` skipped without disconnecting. Returns every MCP tool name."""
@@ -554,10 +598,28 @@ def register_mcp_servers(servers: dict[str, dict]) -> list[str]:
         # An owner's scoped reload orphaned adopters of its shared connections: now that this
         # pass (its rediscovery) is done, give them their tools back under their own scope.
         _lifecycle._reregister_orphaned_adopters()
+        # Then say so if any connection is up with nothing registered for this scope: the one
+        # state that used to pass without a line in any log.
+        _warn_connected_servers_without_tools(servers)
+
+
+def _reapply_tool_filters_quietly(servers: dict[str, dict]) -> dict[str, dict]:
+    """Run :func:`~tools.mcp_tool_registration.reapply_tool_filters`, reporting but never propagating a
+    failure: an edit that only re-filters tools the connection already lists must not cost a scope its
+    discovery pass or its reconcile tick."""
+    try:
+        return _registration.reapply_tool_filters(servers)
+    except Exception:  # health: allow BLE001 -- a diagnostic-grade refresh, never a reason to abort
+        logger.warning("MCP: could not re-apply a changed tools filter to the live connections",
+                       exc_info=True)
+        return {}
 
 
 def _register_mcp_servers(servers: dict[str, dict]) -> list[str]:
     scoped_healed = _registration.register_connected_into_current_scope(servers)
+    # Re-apply a ``tools.include``/``exclude`` edit to the connections that are already live: they are
+    # not connect candidates, so this pass is the only one that sees the new filter (t_aa995a52).
+    _reapply_tool_filters_quietly(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return _registration._existing_tool_names() if _core._mcp_registry_scope() is not None else []
@@ -666,7 +728,10 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     whose earlier connect failed and whose cooldown has lapsed. Scoped to the current registry
     scope (one multiplexed profile's config prunes only its own connections). A lazily registered
     (schema-cache) server loses its cached tools; one still mid-connect cannot be torn down yet and
-    is reported under ``"pending"`` so the caller retries. Returns
+    is reported under ``"pending"`` so the caller retries. A changed ``tools.include``/``exclude``
+    changes no server at all, so it is re-applied to the connections that stay live here
+    (``mcp_tool_registration.reapply_tool_filters``); that is the only tick that sees such an edit
+    while the session stays up. Returns
     ``{"removed": [...], "added": [...], "pending": [...]}``; a no-op when nothing changed."""
     with _owner_secret_scope():
         servers = _config._load_mcp_config()
@@ -687,6 +752,10 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     added = _awaiting_connect(wanted, scope)
     if added:
         discover_mcp_tools()
+    # A ``tools.include``/``exclude`` edit changes no server, so ``added`` is empty and discovery never
+    # runs: without this the housekeeping tick kept a live connection's old filter for the life of the
+    # process (t_aa995a52). Idempotent, and silent unless a filter actually moved.
+    _reapply_tool_filters_quietly(servers)
     return {"removed": stale + sorted(_key_name(k) for k in lazy), "added": added,
             "pending": sorted(connecting - wanted)}
 
