@@ -4330,12 +4330,50 @@ def _housekeeping_channel_directory(adapters, loop) -> None:
     from gateway.channel_directory import build_channel_directory
     if loop is not None:
         # build_channel_directory is async (Slack web calls) and this is a background thread:
-        # schedule onto the gateway loop and wait briefly so refresh failures still log.
+        # schedule onto the gateway loop and wait briefly so refresh failures still log. The
+        # scheduling thread's context travels with the coroutine (run_coroutine_threadsafe), so
+        # a caller inside ``_profile_runtime_scope`` gets that home's directory AND that home's
+        # session store.
         fut = safe_schedule_threadsafe(
             build_channel_directory(adapters), loop, logger=logger,
             log_message="Channel directory refresh scheduling error")
         if fut is not None:
             fut.result(timeout=30)
+
+
+def _housekeeping_channel_directories(runner, adapters, loop) -> None:
+    """Refresh the channel directory of every home this gateway serves, each from its own bot's view.
+
+    A directory is the gateway's cache of what ITS bot can see, so one bot's view is not another's:
+    a multiplexed process must write one file per served home. Building once per process wrote only
+    ``get_hermes_home()``'s copy (the launch home), so a named profile's directory stayed frozen at
+    whatever a previous single-profile gateway last saw, and a room only that profile's bot ever saw
+    never appeared in its own profile's file. Each build enumerates the served profile's own adapters
+    and reads that profile's own ``state.db`` -- never another profile's.
+
+    A home whose build or write fails is logged and the remaining homes still land: the tick-level
+    catcher would otherwise abandon every profile after the first broken one, every tick.
+    """
+    config = getattr(runner, "config", None)
+    if runner is None or not getattr(config, "multiplex_profiles", False):
+        # Single-profile gateway: one directory, the launch home's, exactly as before.
+        if adapters:
+            _housekeeping_channel_directory(adapters, loop)
+        return
+    primary = getattr(runner, "_primary_profile_name", None) or "default"
+    secondary = getattr(runner, "_profile_adapters", None) or {}
+    for name, home in _multiplex_profile_homes(config):
+        # ``self.adapters`` is always the primary (default) profile's map; a named profile's bots
+        # live in ``_profile_adapters``. A profile not (yet) started in this process is skipped:
+        # its file belongs to whoever does serve it, and an empty map here would blank a good file.
+        profile_adapters = adapters if name == primary else secondary.get(name)
+        if not profile_adapters:
+            continue
+        try:
+            with _profile_runtime_scope(Path(home)):
+                _housekeeping_channel_directory(profile_adapters, loop)
+        except Exception as exc:
+            logger.warning("Channel directory: profile '%s' refresh failed: %s", name, exc)
 
 
 def _housekeeping_paste_sweep() -> None:
@@ -4505,7 +4543,7 @@ def _start_gateway_housekeeping(
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
     chores += [
-        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
+        (5, "Channel directory refresh", lambda: _housekeeping_channel_directories(runner, adapters, loop)),
         (60, "Media cache cleanup", housekeeping_media_caches),
         (60, "Paste sweep", _housekeeping_paste_sweep)]
     # Low disk + auto-prune undecided: ask on the home channel (two syscalls; snoozed per post).
