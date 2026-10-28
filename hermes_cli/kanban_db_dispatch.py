@@ -366,13 +366,26 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
     survives a reboot could match an unrelated process with the same PID and the same tick value;
     ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
+    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable,
+    and on a host with no boot witness (macOS has no ``/proc``), where no restart-stable value exists."""
     from gateway.drain_control import current_instantiation_epoch
     from gateway.status import get_process_start_time
     start = get_process_start_time(int(pid))
     if start is None:
         return None
-    return f"{current_instantiation_epoch()}|{start}"
+    epoch = current_instantiation_epoch()
+    if not epoch:
+        # No boot witness on this host. `current_instantiation_epoch` reads /proc (Linux
+        # only) and returns "" on macOS, so the composed value here would be "|<start>".
+        # The whole point of the composed value is that it never survives a reboot; a bare
+        # start time does, because start times repeat across boots. Rather than hand the
+        # caller a fingerprint that cannot do its job, return None so it routes to
+        # UNVERIFIED_WORKER_FINGERPRINT -- which HOLDS the claim and never signals, the
+        # designed answer to missing process identity (#99558). Comparing the un-witnessed
+        # value instead is what declared live workers dead, released their claim, and
+        # spawned duplicates on one worktree.
+        return None
+    return f"{epoch}|{start}"
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:
@@ -400,7 +413,13 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        current = _process_fingerprint(int(pid))
+        if current is None:
+            # The fingerprint cannot be verified on this host (no boot witness), so a
+            # comparison here would report a live worker as recycled. Missing identity is
+            # refusal, not permission (#99558): hold the claim, never signal.
+            return False
+        return current != started_at
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:

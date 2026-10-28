@@ -88,6 +88,9 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
 
     conn = board
     killed = []
+    # The witness is supplied, not read from the host: a host without one (macOS) cannot model
+    # "another boot", and the fixed code reports no fingerprint there at all.
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "boot:1")
     live_fingerprint = kbd._process_fingerprint(os.getpid())
     assert live_fingerprint is not None and live_fingerprint.split("|", 1)[1] == str(
         __import__("gateway.status", fromlist=["x"]).get_process_start_time(os.getpid()))
@@ -106,8 +109,50 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
 
     # The same value re-derived on THIS boot still identifies our worker (the witness is stable
     # within a boot, unlike the recorded epoch of a previous one).
-    drain_control.current_instantiation_epoch.cache_clear()
     assert kbd._process_fingerprint(os.getpid()) == live_fingerprint
+
+
+def test_empty_instantiation_epoch_is_unverifiable_not_a_stable_fingerprint(board, monkeypatch):
+    """A host with no boot witness (macOS: ``current_instantiation_epoch()`` is "") cannot prove that a
+    restarted row is ours. The old composed value was "|<start>", identical on every boot, so a live
+    worker compared as recycled: claim released and a duplicate spawned onto the same worktree. A
+    fresh spawn is persisted UNVERIFIED and a row already written in that old form is held, never
+    released or signalled."""
+    from gateway import drain_control, status
+
+    conn = board
+    killed = []
+    sig = lambda pid, s: killed.append((pid, s))
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    start = status.get_process_start_time(os.getpid())
+    assert start is not None  # only the boot witness is missing
+    assert kbd._process_fingerprint(os.getpid()) is None
+
+    # The spawn path persists the unverified marker, never the boot-invariant "|<start>".
+    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    row = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["worker_started_at"] == kbd.UNVERIFIED_WORKER_FINGERPRINT
+    old = int(time.time()) - 3600
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET started_at = ?, claim_expires = ? WHERE id = ?", (old, old, tid))
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                     (old, tid))
+    assert kbd.enforce_max_runtime(conn, signal_fn=sig) == []
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 0
+    assert killed == []
+    assert kb.get_task(conn, tid).status == "running"
+
+    # A row written before this fix ("|<start>") still belongs to the live worker: an unreadable
+    # witness means "cannot verify", not "recycled", so the claim is extended, not released.
+    old_form = f"|{start}"
+    tid2 = _claimed_running(conn, pid=os.getpid(), started_at=old_form)
+    assert kbd._worker_alive(os.getpid(), old_form) is True
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 0
+    assert killed == []
+    task = kb.get_task(conn, tid2)
+    assert task.status == "running" and task.worker_pid == os.getpid()
 
 
 def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeypatch):
