@@ -80,6 +80,7 @@ def test_matching_fingerprint_keeps_the_live_worker(board):
     assert killed and killed[0] == (os.getpid(), signal.SIGTERM)
 
 
+@pytest.mark.platforms("linux")  # the scenario needs a boot witness, which only /proc provides
 def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     """A row that survived a reboot: the PID AND the boot-relative start tick both match a process on
     this boot (the Linux start time is clock ticks since boot, so that recurs), but the persisted
@@ -149,3 +150,34 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def test_a_host_without_a_boot_witness_holds_the_claim(board, monkeypatch):
+    """macOS has no /proc, so ``current_instantiation_epoch()`` returns "". The composed fingerprint
+    would then be "|<start>", a value that survives a reboot, so it cannot tell a live worker from a
+    process that recycled the PID. Capture must refuse instead: a spawn on such a host records the
+    unverified marker, which every reclaim path HOLDS rather than releases or signals beside a live
+    worker."""
+    from gateway import drain_control
+
+    conn = board
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    assert kbd._process_fingerprint(os.getpid()) is None
+
+    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    row = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["worker_started_at"] == kbd.UNVERIFIED_WORKER_FINGERPRINT
+    old = int(time.time()) - 3600
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET started_at = ?, claim_expires = ? WHERE id = ?", (old, old, tid))
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                     (old, tid))
+
+    killed = []
+    sig = lambda pid, s: killed.append((pid, s))
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 0
+    assert kbd.enforce_max_runtime(conn, signal_fn=sig) == []
+    assert killed == []
+    assert kb.get_task(conn, tid).status == "running"
