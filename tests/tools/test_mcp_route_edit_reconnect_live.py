@@ -1,12 +1,15 @@
 """End-to-end with a real stdio child and a real ``config.yaml`` on disk: an edit to what a LIVE
-server is opened with replaces that connection (card t_9fcf9dc8, the credential half of the
-url / headers / auth family).
+server is opened with replaces that connection.
 
 ``test_mcp_route_edit_reconnects.py`` pins the verdict against stand-in connections. This one pins
 that the verdict reaches the real transport: a credential edit on disk must close the running child,
 open a new one with the new value, and leave the profile's tool registered and answering. The unit
 tests keep the url / header wording; this is the same identity comparison, proven through the SDK,
 the registry and the process teardown.
+
+Two shapes, because the ledger keys differ: a multiplexed gateway keys the connection ``(scope,
+name)`` (t_9fcf9dc8), a single-profile process keys it by the bare name and has no overlay to heal
+(t_f8972837).
 """
 
 from __future__ import annotations
@@ -46,15 +49,20 @@ def _write_config(home, key: str) -> None:
     os.utime(path, (stamp, stamp))
 
 
-@pytest.mark.no_isolate
-@pytest.mark.platforms("posix")
-def test_a_credential_edit_replaces_a_live_stdio_server(monkeypatch, tmp_path):
-    pytest.importorskip("mcp.server.mcpserver")
+def _prepare(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     (home / "server.py").write_text(SERVER, encoding="utf-8")
     _write_config(home, "first")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+@pytest.mark.no_isolate
+@pytest.mark.platforms("posix")
+def test_a_credential_edit_replaces_a_live_stdio_server(monkeypatch, tmp_path):
+    pytest.importorskip("mcp.server.mcpserver")
+    home = _prepare(tmp_path, monkeypatch)
     monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
 
     from tools import mcp_tool_discovery as disc
@@ -82,6 +90,48 @@ def test_a_credential_edit_replaces_a_live_stdio_server(monkeypatch, tmp_path):
             "the tool must answer from the new child, not the old one"
         assert registry.snapshot_registration("mcp__cred__key", scope=key[0]) is not None
         # The old child is closed, not leaked beside the new one.
+        old_task = getattr(before, "_task", None)
+        assert old_task is None or old_task.done()
+    finally:
+        from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+        shutdown_mcp_servers()
+        _loop._stop_mcp_loop()
+
+
+@pytest.mark.no_isolate
+@pytest.mark.platforms("posix")
+def test_a_credential_edit_replaces_a_live_stdio_server_single_profile(monkeypatch, tmp_path):
+    """The same edit, in a process that serves no other profile: the connection is keyed by the bare
+    name and there is no overlay to rebuild, so nothing but this teardown could reconnect it
+    (t_f8972837)."""
+    pytest.importorskip("mcp.server.mcpserver")
+    home = _prepare(tmp_path, monkeypatch)
+    monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: False)
+    monkeypatch.setattr("agent.secret_scope.serves_routed_profile", lambda: False)
+
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_loop as _loop
+    from tools.mcp_tool_common import _core
+    from tools.registry import registry
+
+    try:
+        assert "mcp__cred__key" in disc.discover_mcp_tools()
+        assert _core._mcp_registry_scope() is None, "this is the single-profile layout under test"
+        before = _core._servers["cred"]
+        assert "first" in registry.dispatch("mcp__cred__key", {})
+
+        _write_config(home, "second")  # the edit: same command, new credential
+        result = disc.reconcile_mcp_servers_with_config()
+
+        assert result == {"removed": [], "added": ["cred"], "pending": []}, result
+        after = _core._servers.get("cred")
+        assert after is not None and after is not before, \
+            "the live connection must be replaced, not left running on the old credential"
+        assert after._config["env"]["DEMO_KEY"] == "second"
+        second = registry.dispatch("mcp__cred__key", {})
+        assert "second" in second and "first" not in second, \
+            "the tool must answer from the new child, not the old one"
+        assert registry.snapshot_registration("mcp__cred__key") is not None
         old_task = getattr(before, "_task", None)
         assert old_task is None or old_task.done()
     finally:

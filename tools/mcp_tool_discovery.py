@@ -714,27 +714,15 @@ def _connections_to_replace(servers: dict[str, dict]) -> set[str]:
     Such a connection is up but is a DIFFERENT connection now, so it must not read as connected: the
     next pass closes it and dials the configured route (``mcp_tool_registration``). Without this the
     reconcile saw a live name, a wanted name, and nothing to do — so an edit waited for a restart
-    while the session answered keepalives on the endpoint the user had replaced (t_9fcf9dc8).
+    while the session answered keepalives on the endpoint the user had replaced (t_9fcf9dc8). This
+    holds unscoped too: a single-profile process (an interactive CLI/TUI, a long-lived worker) keys
+    its connections by bare name and reconnects them the same way (t_f8972837).
 
-    Only connections this scope OWNS: another profile's connection is not this config's to judge,
-    and this profile detaches its overlay of one instead (it may still adopt the replacement if the
-    route matches). Snapshot under the lock, compare outside it: the comparison fingerprints configs.
+    Only connections this registry scope OWNS: another profile's connection is not this config's to
+    judge, and this profile detaches its overlay of one instead (it may still adopt the replacement
+    if the route matches).
     """
-    scope = _core._mcp_registry_scope()
-    if scope is None:
-        # A single-profile process keys its connections by bare name and keeps no overlay: the
-        # replacement path (``register_connected_into_current_scope``) only heals overlays under a
-        # scope, so nothing here could reconnect it. Reporting one would promise a reconnect this
-        # path cannot make, every tick; that process still needs ``/reload-mcp`` after a url edit,
-        # which is unchanged and outside this card.
-        return set()
-    with _core._lock:
-        owned = [(_key_name(key), server) for key, owner in _core._server_scope_keys.items()
-                 if owner == scope and (server := _core._servers.get(key)) is not None]
-    return {name for name, server in owned
-            if (config := servers.get(name)) is not None and mcp_server_enabled(config)
-            and getattr(server, "session", None) is not None
-            and not _registration._same_server_route(server, config)}
+    return set(_registration._changed_own_connections(servers, _core._mcp_registry_scope()))
 
 
 def _unregistered(wanted: set[str], scope) -> set[str]:

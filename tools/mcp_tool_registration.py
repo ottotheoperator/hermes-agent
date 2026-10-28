@@ -526,10 +526,62 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
             and resolved_identity is not None and recorded == resolved_identity)
 
 
+def _changed_own_connections(servers: dict, scope) -> set[str]:
+    """Names whose OWN live connection was opened on a route or with credentials ``servers`` no
+    longer holds (a url, headers, auth or TLS edit — a ``tools`` filter edit is not in the identity).
+
+    OWNS, not borrows: another profile's connection is not this scope's config to judge. Snapshot
+    under the lock, compare outside it: the comparison fingerprints configs (and a cross-profile
+    adopter's resolution does PATH lookups). A bare-name key (``scope is None``) is its own owner, so
+    a single-profile process judges exactly the same way a multiplexed profile does (t_f8972837);
+    the key is read from the ledger AND from the key itself, so a live bare connection whose owner
+    entry was never recorded cannot escape the verdict.
+    """
+    with _core._lock:
+        owned = {key for key, owner in _core._server_scope_keys.items() if owner == scope}
+        owned |= {key for key in _core._servers if _key_scope(key) == scope}
+        live = [(_key_name(key), server) for key in owned
+                if (server := _core._servers.get(key)) is not None
+                and getattr(server, "session", None) is not None]
+    changed = set()
+    for name, server in live:
+        config = servers.get(name)
+        if config is None or not mcp_server_enabled(config):
+            continue
+        if not _same_server_route(server, config):
+            changed.add(name)
+    return changed
+
+
+def _close_changed_own_connections(servers: dict, scope) -> list[str]:
+    """Close this scope's own live connections whose configured identity moved; return their names.
+
+    A connection that is up on a route the config no longer carries is a DIFFERENT connection now,
+    and closing it is the only way discovery can reconnect it: a key already in ``_servers`` is never
+    a connect candidate (``mcp_tool_discovery._select_new_servers``). Detaching an overlay alone left
+    the old session serving the old endpoint with no tools registered anywhere, for the life of the
+    process (t_9fcf9dc8). Deliberately separate from the overlay healing around it: it needs no
+    scope, and it is the one repair a single-profile process can make too (t_f8972837).
+    """
+    changed = sorted(_changed_own_connections(servers, scope))
+    if not changed:
+        return []
+    from tools import mcp_tool_lifecycle as _lifecycle  # local: lifecycle imports discovery
+    logger.info("MCP server(s) %s: the configured url/headers/credentials changed; "
+                "replacing the live connection", ", ".join(changed))
+    _lifecycle.shutdown_mcp_servers(scope=scope, names=set(changed))
+    return changed
+
+
 def register_connected_into_current_scope(servers: dict) -> int:
     """Serialize shared-scope reconciliation and registration for one discovery pass."""
     scope = _core._mcp_registry_scope()
     if scope is None:
+        # No overlay exists to heal, and the adoption loop below must never run unscoped: the global
+        # registry would adopt a connection another profile owns. The teardown does not need a scope,
+        # though, and without it a single-profile process (an interactive CLI/TUI, a long-lived
+        # worker) kept its old session on an edited url for the life of the process (t_f8972837).
+        _close_changed_own_connections(servers, None)
         return 0
     with _SCOPE_REFRESH_LOCKS[hash(scope) % len(_SCOPE_REFRESH_LOCKS)]:
         return _register_connected_into_current_scope(servers)
@@ -574,7 +626,6 @@ def _register_connected_into_current_scope(servers: dict) -> int:
 
     with _core._lock:
         stale = []
-        replaced = []  # own connections this profile must close; discovery reconnects them below
         # Every key this scope has an overlay for, PLUS every live connection it OWNS: a connection
         # whose overlay was already dropped (the state this card clears out, and the one a close that
         # could not land leaves behind) is absent from ``_server_tool_scopes`` and used to escape
@@ -597,22 +648,16 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                     or not _same_server_route(server, config, cross_profile=not owned,
                                               resolved_identity=resolved_ids.get(name))):
                 stale.append(key)
-                # This profile's OWN connection, still live, whose configured route or credentials
-                # changed: it is a different connection now, and detaching the overlay alone left
-                # the old session serving the old endpoint with no tools registered anywhere (a
-                # connected key is never a connect candidate, so nothing rebuilt it - t_9fcf9dc8).
-                # Close it, and the connect pass below dials the new route. Only when THIS pass
-                # carries the name: a subset pass that cannot reconnect must not leave it down.
-                if (owned and name in servers and config is not None and mcp_server_enabled(config)
-                        and live):
-                    replaced.append(name)
     for key in stale:
         _remove_server_scope(key, scope)
-    if replaced:
-        from tools import mcp_tool_lifecycle as _lifecycle  # local: lifecycle imports discovery
-        logger.info("MCP server(s) %s: the configured url/headers/credentials changed; "
-                    "replacing the live connection", ", ".join(sorted(set(replaced))))
-        _lifecycle.shutdown_mcp_servers(scope=scope, names=set(replaced))
+    # This profile's OWN connection, still live, whose configured route or credentials changed: it is
+    # a different connection now, and detaching the overlay alone left the old session serving the
+    # old endpoint with no tools registered anywhere (a connected key is never a connect candidate,
+    # so nothing rebuilt it - t_9fcf9dc8). Close it, and the connect pass below dials the new route.
+    # Only when THIS pass carries the name: a subset pass that cannot reconnect must not leave it
+    # down. Separate from the overlay healing above so the unscoped owner can run the same teardown
+    # (t_f8972837).
+    _close_changed_own_connections(servers, scope)
 
     registered_servers = 0
     for name, config in servers.items():

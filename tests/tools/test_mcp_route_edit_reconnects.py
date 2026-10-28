@@ -12,6 +12,10 @@ must replace the connection rather than detach from it.
 
 An ADOPTED connection (owned by another profile) keeps the detach-only verdict: its session belongs
 to its owner, whose config did not change.
+
+The same verdict must reach a SINGLE-PROFILE process (no registry scope, connections keyed by the
+bare name): an interactive CLI/TUI, or any long-lived worker, keeps its connections too, and it has
+no overlay to heal, so the teardown is what reconnects it (t_f8972837).
 """
 
 from __future__ import annotations
@@ -382,10 +386,78 @@ def test_an_owner_reconnect_gives_an_adopting_profile_its_tools_back(profile, mo
         registry.deregister("mcp__x__t", scope=borrower_scope)
 
 
-def test_a_single_profile_process_is_left_to_reload_mcp(profile, monkeypatch):
-    """The limitation, pinned so a later fix flips it on purpose: without a registry scope there is no
-    overlay to rebuild, so the reconcile must NOT claim it replaced anything it cannot. A single-profile
-    process (an interactive CLI/TUI) still needs ``/reload-mcp`` after a url edit, exactly as before."""
+def test_a_single_profile_process_reconnects_a_url_edited_server(profile, monkeypatch):
+    """A single-profile process (an interactive CLI/TUI, or a long-lived worker) owns its live
+    connections under bare-name keys and has no overlay to heal, so the scope-gated replacement in
+    ``register_connected_into_current_scope`` used to skip it entirely: after a url edit the old
+    session stayed up on the old endpoint and discovery never dialled the new one, because a key
+    already in ``_core._servers`` is never a connect candidate. The stale-identity verdict must
+    close that connection on this path too, and the same pass must redial it (t_f8972837)."""
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_loop as loop
+    from tools import mcp_tool_registration as reg
+
+    monkeypatch.setattr(profile.core, "_mcp_registry_scope", lambda: None)
+    before, after = _config(), _config(url=_URL_MOVED)
+    old = _server("x", before)
+    disc._adopt_server("x", old)
+    assert reg._register_server_tools("x", old, before) == ["mcp__x__t"]
+
+    closed, connected = [], []
+    _record_shutdown(old, closed, "x")
+    _stub_connect(monkeypatch, disc, reg, connected)
+
+    loop._ensure_mcp_loop()
+    try:
+        disc.register_mcp_servers({"x": after})
+    finally:
+        loop._stop_mcp_loop()
+
+    assert closed == ["x"], "a connection whose route changed must be closed, not left serving the old one"
+    assert connected == [("x", after)], "the same discovery pass must reconnect it with the new config"
+    new = profile.core._servers["x"]
+    assert new is not old
+    assert new._config == after
+    assert profile.registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"], \
+        "the tools must be registered again, on the connection that now runs"
+
+
+def test_the_reconcile_tick_reconnects_a_url_edited_server_in_a_single_profile_process(
+        profile, monkeypatch):
+    """The housekeeping tick is the only thing that notices a url edit while the session stays up.
+    Unscoped it used to report nothing to do, so the edit waited for a restart or ``/reload-mcp``."""
+    from tools import mcp_tool_config as _config_mod
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_loop as loop
+    from tools import mcp_tool_registration as reg
+
+    monkeypatch.setattr(profile.core, "_mcp_registry_scope", lambda: None)
+    before, after = _config(), _config(url=_URL_MOVED)
+    server = _server("x", before)
+    disc._adopt_server("x", server)
+    assert reg._register_server_tools("x", server, before) == ["mcp__x__t"]
+
+    closed, connected = [], []
+    _record_shutdown(server, closed, "x")
+    _stub_connect(monkeypatch, disc, reg, connected)
+    monkeypatch.setattr(_config_mod, "_load_mcp_config", lambda: {"x": copy.deepcopy(after)})
+
+    loop._ensure_mcp_loop()
+    try:
+        result = disc.reconcile_mcp_servers_with_config()
+    finally:
+        loop._stop_mcp_loop()
+
+    assert result == {"removed": [], "added": ["x"], "pending": []}, result
+    assert closed == ["x"], "the tick must replace the connection, not leave it on the old endpoint"
+    assert connected == [("x", after)]
+    assert profile.core._servers["x"]._config == after
+    assert profile.registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
+
+
+def test_a_settled_config_in_a_single_profile_process_never_restarts(profile, monkeypatch):
+    """The new unscoped verdict must fire on a config that MOVED, never on one that merely is not the
+    live one: a comparison that fires while settled would respawn the server on every tick."""
     from tools import mcp_tool_config as _config_mod
     from tools import mcp_tool_discovery as disc
     from tools import mcp_tool_registration as reg
@@ -397,11 +469,10 @@ def test_a_single_profile_process_is_left_to_reload_mcp(profile, monkeypatch):
     assert reg._register_server_tools("x", server, cfg) == ["mcp__x__t"]
     discovered: list[str] = []
     monkeypatch.setattr(disc, "discover_mcp_tools", lambda *a, **k: discovered.append("ran") or [])
-    monkeypatch.setattr(_config_mod, "_load_mcp_config",
-                        lambda: {"x": _config(url=_URL_MOVED)})
+    monkeypatch.setattr(_config_mod, "_load_mcp_config", lambda: {"x": copy.deepcopy(cfg)})
 
     assert disc.reconcile_mcp_servers_with_config() == {"removed": [], "added": [], "pending": []}
-    assert discovered == [], "a reconnect this path cannot make must not be announced"
+    assert discovered == [], "no drift, no reconnect"
     assert profile.core._servers["x"] is server
 
 
