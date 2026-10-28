@@ -361,18 +361,33 @@ def _pid_alive(pid: Optional[int]) -> bool:
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
+# A start time at or above this size is an absolute epoch, not clock ticks since boot. The two sources
+# in ``gateway.status.get_process_start_time`` are /proc ticks at 100 Hz (1e11 would be 31 years of
+# uptime) and psutil centiseconds since the epoch (1e11 = 2001). It decides whether a start time with
+# no instantiation epoch can still stand alone as a worker identity.
+_ABSOLUTE_START_FLOOR = 100_000_000_000
+
+
 def _process_fingerprint(pid: int) -> Optional[str]:
     """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
-    time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
+    time alone is clock ticks since THIS boot on Linux (``/proc/<pid>/stat`` field 22), so a row that
     survives a reboot could match an unrelated process with the same PID and the same tick value;
     ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
+    reboot / container recreate, so the composed value never survives one. Where /proc is absent
+    (macOS, Windows) the start time is an absolute epoch instead, so it is unique to the process and
+    never recurs: it witnesses itself and an empty epoch costs nothing. ``None`` when the start time is
+    unreadable, and also when it is boot-relative with no epoch to pair it with — a value that cannot
+    rule out a recycled PID is no identity at all, and comparing it is what released the claim beside
+    a live worker and spawned a duplicate on the same worktree (#99558)."""
     from gateway.drain_control import current_instantiation_epoch
     from gateway.status import get_process_start_time
     start = get_process_start_time(int(pid))
     if start is None:
         return None
-    return f"{current_instantiation_epoch()}|{start}"
+    epoch = current_instantiation_epoch()
+    if not epoch and start < _ABSOLUTE_START_FLOOR:
+        return None
+    return f"{epoch}|{start}"
 
 
 def _worker_alive(pid: Optional[int], started_at) -> bool:

@@ -149,3 +149,57 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def test_an_absolute_start_time_is_its_own_witness_without_a_boot_epoch(board, monkeypatch):
+    """A host without /proc (macOS, Windows) has no instantiation epoch, but its start time is an
+    absolute epoch: unique to the process and not recurring across boots. That value IS the reboot
+    witness, so an empty epoch must not cost the fingerprint (both reapers stop enforcing without it)."""
+    from gateway import drain_control, status
+
+    conn = board
+    absolute = 179321681652  # process_birth * 100 as measured on this host
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: absolute)
+
+    assert kbd._process_fingerprint(os.getpid()) == f"|{absolute}"
+    killed = []
+    tid = _claimed_running(conn, pid=os.getpid(), started_at=f"|{absolute}", max_runtime=1)
+    assert kbd._worker_alive(os.getpid(), f"|{absolute}") is True
+    assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    assert killed[0] == (os.getpid(), signal.SIGTERM)
+
+
+def test_a_boot_relative_start_time_without_a_boot_epoch_is_not_a_witness(board, monkeypatch):
+    """Ticks since boot DO recur across boots (the same PID an hour after a reboot gets the same
+    value), so with no instantiation epoch the composed string cannot tell our worker from a process
+    that recycled the PID. Capture refuses: the spawn records the unverified marker and every reclaim
+    path holds the live worker rather than releasing the claim or signalling beside it."""
+    from gateway import drain_control, status
+
+    conn = board
+    ticks = 8640000  # /proc/<pid>/stat field 22, one hour of uptime
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "")
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: ticks)
+    assert kbd._process_fingerprint(os.getpid()) is None
+
+    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    row = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["worker_started_at"] == kbd.UNVERIFIED_WORKER_FINGERPRINT
+    old = int(time.time()) - 3600
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET started_at = ?, claim_expires = ? WHERE id = ?", (old, old, tid))
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (old, tid),
+        )
+
+    killed = []
+    sig = lambda pid, s: killed.append((pid, s))
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 0
+    assert kbd.enforce_max_runtime(conn, signal_fn=sig) == []
+    assert killed == []
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "running"
