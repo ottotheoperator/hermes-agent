@@ -86,7 +86,7 @@ def _seed_room(home: Path, *, chat_id: str, name: str) -> None:
 def _multiplex_runner(profile_adapters) -> SimpleNamespace:
     return SimpleNamespace(
         config=SimpleNamespace(multiplex_profiles=True),
-        _primary_profile_name="default",
+        _active_profile_name="default",
         _profile_adapters=profile_adapters,
     )
 

@@ -4360,7 +4360,7 @@ def _housekeeping_channel_directories(runner, adapters, loop) -> None:
         if adapters:
             _housekeeping_channel_directory(adapters, loop)
         return
-    primary = getattr(runner, "_primary_profile_name", None) or "default"
+    primary = getattr(runner, "_active_profile_name", None) or "default"
     secondary = getattr(runner, "_profile_adapters", None) or {}
     for name, home in _multiplex_profile_homes(config):
         # ``self.adapters`` is always the primary (default) profile's map; a named profile's bots
