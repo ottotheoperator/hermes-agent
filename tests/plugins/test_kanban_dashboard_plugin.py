@@ -939,6 +939,34 @@ def test_reclaim_endpoint_releases_running_claim(client):
     finally:
         conn2.close()
 
+def test_reclaim_endpoint_holds_the_claim_when_the_worker_did_not_take_the_kill(client):
+    """A live worker whose signal is refused keeps its claim, so the endpoint answers 409 saying so
+    rather than 200: the console shows that instead of silently believing the run was stopped."""
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="running", assignee="x")
+        lock = f"{kb._host_prefix()}1"
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, worker_pid=?, "
+            "worker_started_at=? WHERE id=?",
+            (lock, int(time.time()) + 3600, os.getpid(), "unverified", t),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.post(f"/api/plugins/kanban/tasks/{t}/reclaim", json={"reason": "browser recovery"})
+    assert r.status_code == 409, r.text
+    assert "did not take the kill" in r.json()["detail"]
+
+    conn2 = kbc.connect()
+    try:
+        row = conn2.execute("SELECT status, claim_lock FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row["status"] == "running" and row["claim_lock"] == lock
+    finally:
+        conn2.close()
+
+
 def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
     conn = kbc.connect()

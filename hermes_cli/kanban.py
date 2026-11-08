@@ -600,8 +600,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
-    return _ok_or_err(ok, f"cannot reclaim {args.task_id} (not running or unknown id)",
+        outcome = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
+    if outcome == "held":
+        return _err(
+            f"held {args.task_id}: its worker is still running and did not take the kill, so the claim "
+            f"is kept (no second worker starts); the kill is retried on the next dispatch tick")
+    return _ok_or_err(outcome == "released", f"cannot reclaim {args.task_id} (not running or unknown id)",
                       f"Reclaimed {args.task_id}")
 
 
@@ -612,7 +616,8 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
     return _ok_or_err(
         ok,
-        f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
+        f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release it; "
+        f"a reclaim keeps the claim while its worker survives the kill)",
         f"Reassigned {args.task_id} to {profile or '(unassigned)'}" + (" (claim reclaimed)" if reclaim else ""),
     )
 

@@ -994,7 +994,12 @@ def terminate_run_endpoint(run_id: int, payload: TerminateRunBody, board: Option
         r = _require_run(conn, run_id)
         if r.ended_at is not None:
             raise _conflict(f"run {run_id} already ended")
-        if not kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason):
+        outcome = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        if outcome == "held":
+            raise _conflict(
+                f"run {run_id} was not stopped: its worker did not take the kill, so task {r.task_id} keeps "
+                "its claim (no second worker starts) and the kill is retried on the next dispatch tick")
+        if outcome != "released":
             raise _conflict(f"cannot terminate run {run_id}: task {r.task_id} is no longer in a reclaimable state")
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
 
@@ -1010,7 +1015,12 @@ def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[st
     """Release an active worker claim without waiting for the claim TTL
     (``hermes kanban reclaim <task_id> --reason ...``)."""
     with _board_conn(board) as (board, conn):
-        if not kanban_db.reclaim_task(conn, task_id, reason=payload.reason):
+        outcome = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        if outcome == "held":
+            raise _conflict(
+                f"cannot reclaim {task_id}: its worker is still running and did not take the kill, so the "
+                "claim is kept (no second worker starts); the kill is retried on the next dispatch tick")
+        if outcome != "released":
             raise _conflict(f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
         return {"ok": True, "task_id": task_id}
 

@@ -1150,7 +1150,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert kb.release_stale_claims(conn) == 0
 
         # reclaim_task should work immediately.
-        assert kb.reclaim_task(conn, t, reason="test reason", signal_fn=_signal) is True
+        assert kb.reclaim_task(conn, t, reason="test reason", signal_fn=_signal) == "released"
 
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",

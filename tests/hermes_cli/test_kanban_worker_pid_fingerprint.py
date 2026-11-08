@@ -136,9 +136,9 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert kb.release_stale_claims(conn, signal_fn=sig) == 0
     assert killed == []
     assert kb.get_task(conn, tid).status == "running"
-    # An explicit operator reclaim releases the claim (human override) but still sends nothing.
-    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is True
-    assert killed == []
+    # An explicit operator reclaim is no exception: the kill is refused, so the claim is held.
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) == "held"
+    assert killed == [] and kb.get_task(conn, tid).status == "running"
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.
     tid2 = kb.create_task(conn, title="job2", assignee="worker")
@@ -149,3 +149,57 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def _events(conn, task_id: str, kind: str) -> list[dict]:
+    import json
+
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id", (task_id, kind),
+    ).fetchall()
+    return [json.loads(r["payload"]) for r in rows]
+
+
+def test_manual_reclaim_holds_the_claim_when_its_signal_is_refused(board, monkeypatch):
+    """An operator reclaim whose kill is refused (UNVERIFIED spawn still live) must keep the claim:
+    releasing it starts a second worker beside the first. The refusal is recorded as
+    ``reclaim_deferred`` + ``signal_refused`` so the caller can say why the card still runs."""
+    from gateway import status
+
+    conn = board
+    killed = []
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+    tid = kb.create_task(conn, title="job", assignee="worker")
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    monkeypatch.undo()
+    assert kbd._worker_alive(os.getpid(), kbd.UNVERIFIED_WORKER_FINGERPRINT) is True
+
+    sig = lambda pid, s: killed.append((pid, s))
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) == "held"
+    assert killed == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "running" and task.claim_lock is not None and task.worker_pid == os.getpid()
+    assert _events(conn, tid, "reclaimed") == []
+    deferred = _events(conn, tid, "reclaim_deferred")
+    assert deferred and deferred[-1]["reason"] == "manual_reclaim_worker_alive"
+    assert deferred[-1]["signal_refused"] is True and deferred[-1]["terminated"] is False
+
+
+def test_manual_reclaim_releases_the_claim_once_the_worker_is_gone(board, monkeypatch):
+    """The other direction: the kill lands, so the claim is released and the card can be claimed
+    again immediately — the operator path is not weakened for a worker that is really gone."""
+    conn = board
+    killed = []
+    tid = kb.create_task(conn, title="job", assignee="worker")
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, os.getpid())
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    sig = lambda pid, s: killed.append((pid, s))
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) == "released"
+    assert killed == [(os.getpid(), signal.SIGTERM)]
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready" and task.claim_lock is None and task.worker_pid is None
+    assert _events(conn, tid, "reclaimed")[-1]["terminated"] is True
+    assert kb.claim_task(conn, tid) is not None

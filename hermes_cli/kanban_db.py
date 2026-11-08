@@ -2474,20 +2474,30 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
 
 def reclaim_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
-) -> bool:
+) -> str:
     """Operator reclaim regardless of TTL: release the claim, restore the source
-    phase, reset the failure counter. False when not running."""
+    phase, reset the failure counter. Returns ``"released"``, ``"held"`` when our
+    own worker survived the kill (the claim stays, see ``reclaim_deferred``) or
+    ``"noop"`` when there was nothing to reclaim."""
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
-        return False
+        return "noop"
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
-        return False
+        return "noop"
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+    # Same rule as the TTL paths: a worker of ours that survived its kill must keep
+    # the claim, or the next spawn runs beside it (the duplicate-worker episodes).
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn, task_id, prev_lock, int(time.time()), termination,
+            reason="manual_reclaim_worker_alive",
+        )
+        return "held"
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -2497,7 +2507,7 @@ def reclaim_task(
             "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
-            return False
+            return "noop"
         _record_reclaim(
             conn, task_id, termination,
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
@@ -2505,7 +2515,7 @@ def reclaim_task(
         )
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
-    return True
+    return "released"
 
 
 def reassign_task(
