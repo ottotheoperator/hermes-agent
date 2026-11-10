@@ -23,13 +23,13 @@ from tools.plugin_guard_context import (
     is_disclosed_config_note, is_doc_prose, is_env_dump_in_safety_clause, is_hex_in_char_class,
     is_inert_fixture_line, is_json_prose_value, is_locale_catalog, is_loopback_continuation,
     is_loopback_only, is_own_proc_read, is_pip_install_in_prose_literal, is_public_client_key,
-    is_quoted_injection_phrase, is_regex_alternation_token, is_repo_root_traversal,
+    is_quoted_injection_in_refusal, is_quoted_injection_phrase, is_regex_alternation_token, is_repo_root_traversal,
     is_self_uninstall_doc, is_sudo_inert, is_test_tree, is_trusted_installer_pipe, logical_line, prose_cap)
 from tools.skills_guard import (
     Finding, ScanResult, SUSPICIOUS_BINARY_EXTENSIONS, _determine_verdict, format_scan_report,
     scan_file)
 
-PLUGIN_SCANNER_VERSION = "plugin-guard-v12"
+PLUGIN_SCANNER_VERSION = "plugin-guard-v13"
 
 # Never scanned: VCS internals, caches, vendored envs.
 EXCLUDED_DIRS = {
@@ -280,6 +280,7 @@ def _inert_context_cap(f: Finding, rel_path: str, line: str, joined: str, is_cod
         or is_benign_lazy_os_import(f, line)      # `__import__("os").environ.get(...)` one member
         or is_disclosed_config_note(f, rel_path)  # disclosed scoped config-write in install docs
         or is_authorized_keys_prose(f, line, doc_prose)  # `authorized_keys` in a UI string, no write
+        or is_quoted_injection_in_refusal(f, line)  # "ignore previous instructions" quoted in a refusal
     )
     if to_medium:
         return _at_most(sev, "medium")
